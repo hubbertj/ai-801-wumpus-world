@@ -1,7 +1,12 @@
 """Entry point for the Wumpus World AI Simulation.
 
-Run with:
-    uv run wumpus-world
+Pygame graphical simulation (default when a display is available):
+    uv run wumpus-world              # Menu, then 2D simulation window
+    uv run wumpus-world --graphical  # Force graphical mode
+
+Terminal-only (headless):
+    uv run wumpus-world --headless
+    WUMPUS_HEADLESS=1 uv run wumpus-world
 """
 
 from __future__ import annotations
@@ -146,8 +151,13 @@ def _show_menu(screen, fonts: dict) -> DifficultyLevel:
 # Pygame game loop
 # ---------------------------------------------------------------------------
 
-def _run_pygame(difficulty: DifficultyLevel) -> tuple[bool, int]:
-    """Run the full Pygame simulation."""
+def _run_pygame(difficulty: DifficultyLevel) -> tuple[str, bool, int] | tuple[str, DifficultyLevel, int]:
+    """Run the full Pygame simulation.
+
+    Returns:
+        ("quit", won, score) when the user quits after game over.
+        ("play_again", difficulty, score) when the user chooses to play again.
+    """
     import pygame
     from wumpus_world.renderer import WumpusRenderer
 
@@ -163,6 +173,7 @@ def _run_pygame(difficulty: DifficultyLevel) -> tuple[bool, int]:
     renderer.draw()
 
     max_steps = world.size * world.size * 6
+    play_again = False
 
     while renderer.running:
         now = pygame.time.get_ticks()
@@ -170,12 +181,22 @@ def _run_pygame(difficulty: DifficultyLevel) -> tuple[bool, int]:
 
         if world.game_over:
             renderer.draw_game_over(world.won, world.score)
-            # Wait for keypress to exit
-            waiting = True
-            while waiting:
+            # Wait for Play again (ENTER/R) or Quit (Q/Esc)
+            while True:
                 for event in pygame.event.get():
-                    if event.type in (pygame.QUIT, pygame.KEYDOWN):
-                        waiting = False
+                    if event.type == pygame.QUIT:
+                        pygame.quit()
+                        return ("quit", world.won, world.score)
+                    if event.type == pygame.KEYDOWN:
+                        if event.key in (pygame.K_q, pygame.K_ESCAPE):
+                            pygame.quit()
+                            return ("quit", world.won, world.score)
+                        if event.key in (pygame.K_RETURN, pygame.K_KP_ENTER, pygame.K_r):
+                            play_again = True
+                            break
+                if play_again:
+                    break
+                renderer.clock.tick(60)
             break
 
         should_step = (
@@ -192,8 +213,10 @@ def _run_pygame(difficulty: DifficultyLevel) -> tuple[bool, int]:
 
         renderer.clock.tick(60)
 
+    if play_again:
+        return ("play_again", difficulty, world.score)
     pygame.quit()
-    return world.won, world.score
+    return ("quit", world.won, world.score)
 
 
 # ---------------------------------------------------------------------------
@@ -201,10 +224,11 @@ def _run_pygame(difficulty: DifficultyLevel) -> tuple[bool, int]:
 # ---------------------------------------------------------------------------
 
 def main() -> None:
+    force_graphical = "--graphical" in sys.argv or "-g" in sys.argv
     headless = (
         "--headless" in sys.argv
         or os.environ.get("WUMPUS_HEADLESS", "").lower() in ("1", "true", "yes")
-        or not _has_display()
+        or (not _has_display() and not force_graphical)
     )
 
     if headless:
@@ -217,7 +241,7 @@ def main() -> None:
 
         W, H = 680, 460
         screen = pygame.display.set_mode((W, H))
-        pygame.display.set_caption("Wumpus World – Select Difficulty")
+        pygame.display.set_caption("Wumpus World – Pygame graphical simulation")
 
         fonts = {
             "title":  pygame.font.SysFont("monospace", 30, bold=True),
@@ -226,10 +250,18 @@ def main() -> None:
             "hint":   pygame.font.SysFont("monospace", 12),
         }
 
-        difficulty = _show_menu(screen, fonts)
-        pygame.quit()
+        won, score = False, 0
+        while True:
+            difficulty = _show_menu(screen, fonts)
+            result = _run_pygame(difficulty)
+            if result[0] == "quit":
+                won, score = result[1], result[2]
+                break
+            # Play again: switch back to menu window size and loop
+            screen = pygame.display.set_mode((W, H))
+            pygame.display.set_caption("Wumpus World – Pygame graphical simulation")
 
-        won, score = _run_pygame(difficulty)
+        pygame.quit()
 
     if won:
         print("  Agent successfully retrieved the gold and escaped! 🏆")

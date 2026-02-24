@@ -11,6 +11,7 @@ Layout
 from __future__ import annotations
 
 import os
+from pathlib import Path
 from typing import Optional
 
 # Allow importing without a display (for unit tests / CI)
@@ -107,7 +108,7 @@ class WumpusRenderer:
 
         flags = pygame.NOFRAME if headless else 0
         self.screen = pygame.display.set_mode((total_w, total_h), flags)
-        pygame.display.set_caption("🌍 Wumpus World AI Simulation")
+        pygame.display.set_caption("Wumpus World – Pygame graphical simulation")
 
         # Typography
         self.f_title = pygame.font.SysFont("monospace", 18, bold=True)
@@ -121,6 +122,22 @@ class WumpusRenderer:
         self.step_delay: int = 600   # ms between auto-steps
         self.last_step_ms: int = 0
         self.clock = pygame.time.Clock()
+
+        # Agent sprite sheet (2×2: front, back, left, right); keep ref so subsurfaces stay valid
+        self._agent_sprite_sheet: Optional[pygame.Surface] = None
+        self._agent_sprites: Optional[dict[Direction, pygame.Surface]] = self._load_agent_sprite_sheet()
+
+        # Wumpus character image (optional)
+        self._wumpus_sprite: Optional[pygame.Surface] = self._load_wumpus_sprite()
+
+        # Pit image (optional)
+        self._pit_sprite: Optional[pygame.Surface] = self._load_pit_sprite()
+
+        # Arrow image (weapon used to kill the Wumpus)
+        self._arrow_sprite: Optional[pygame.Surface] = self._load_arrow_sprite()
+
+        # Gold / treasure chest image (optional)
+        self._gold_sprite: Optional[pygame.Surface] = self._load_gold_sprite()
 
         # Layout anchors
         self._world_x = self.PADDING
@@ -198,6 +215,14 @@ class WumpusRenderer:
         s = self.f_body.render(status, True, LIGHT_GRAY)
         self.screen.blit(s, (self.PADDING, 36))
 
+        # Arrow icon (weapon to kill Wumpus) in header
+        if self._arrow_sprite is not None:
+            aw, ah = 40, 20
+            arr = pygame.transform.smoothscale(self._arrow_sprite, (aw, ah))
+            if not w.agent_has_arrow:
+                arr.set_alpha(120)
+            self.screen.blit(arr, (self.PADDING + 245, 32))
+
         hint = self.f_small.render(
             "SPACE=pause  →=step  ↑↓=speed  Q=quit", True, GRAY
         )
@@ -238,44 +263,193 @@ class WumpusRenderer:
                 else:
                     bg = CELL_FOG
 
-                pygame.draw.rect(self.screen, bg, rect)
+                # Cell shading for 2D tile look
+                self._draw_cell_shading(rect, bg)
                 pygame.draw.rect(self.screen, BORDER, rect, 1)
 
                 if is_visited or is_agent:
                     self._draw_world_cell_contents(x, y, pos, cell)
 
                 if is_agent:
-                    self._draw_agent_arrow(x, y)
+                    self._draw_agent_sprite(x, y)
 
                 # Coord label
                 co = self.f_label.render(f"{r},{c}", True, (75, 80, 95))
                 self.screen.blit(co, (x + self.cell_size - 22, y + self.cell_size - 13))
 
+    def _draw_cell_shading(self, rect: pygame.Rect, base_color: tuple) -> None:
+        """Add subtle highlight/shadow so cells look like 2D tiles."""
+        if rect.width < 20:
+            return
+        # Top/left highlight (lighter)
+        highlight = tuple(min(255, c + 18) for c in base_color)
+        pygame.draw.line(self.screen, highlight, rect.topleft, rect.topright, 1)
+        pygame.draw.line(self.screen, highlight, rect.topleft, rect.bottomleft, 1)
+        # Bottom/right shadow
+        shadow = tuple(max(0, c - 15) for c in base_color)
+        pygame.draw.line(self.screen, shadow, rect.bottomleft, rect.bottomright, 1)
+        pygame.draw.line(self.screen, shadow, rect.topright, rect.bottomright, 1)
+
     def _draw_world_cell_contents(self, x: int, y: int, pos, cell) -> None:
         cs = self.cell_size
-        symbols: list[tuple[str, tuple]] = []
+        cx, cy = x + cs // 2, y + cs // 2
+        margin = max(4, cs // 6)
 
-        if cell.has_stench:
-            symbols.append(("S", PURPLE))
-        if cell.has_breeze:
-            symbols.append(("B", TEAL))
-        if cell.has_gold:
-            symbols.append(("G", YELLOW))
+        # Draw 2D graphics for hazards and gold (actual world view)
         if cell.has_pit:
-            symbols.append(("PIT", BLUE))
+            self._draw_pit_graphic(x, y, cs)
         if cell.has_wumpus and self.world.wumpus_alive:
-            symbols.append(("W", RED))
-        if (
-            not self.world.wumpus_alive
-            and self.world.wumpus_pos == pos
-        ):
-            symbols.append(("☠W", GRAY))
+            self._draw_wumpus_graphic(x, y, cs)
+        if not self.world.wumpus_alive and self.world.wumpus_pos == pos:
+            self._draw_wumpus_dead_graphic(x, y, cs)
+        if cell.has_gold:
+            self._draw_gold_graphic(x, y, cs)
 
-        for i, (sym, color) in enumerate(symbols):
-            surf = self.f_small.render(sym, True, color)
-            sx = x + 3 + (i % 2) * (cs // 2)
-            sy = y + 3 + (i // 2) * (cs // 3)
-            self.screen.blit(surf, (sx, sy))
+        # Percept icons (small, so they don't overlap main graphics)
+        icon_y = y + cs - margin - 10
+        if cell.has_stench:
+            self._draw_stench_icon(x + margin, icon_y)
+        if cell.has_breeze:
+            self._draw_breeze_icon(x + cs // 2 - 6, icon_y)
+        if cell.has_breeze and cell.has_stench:
+            self._draw_breeze_icon(x + cs - margin - 12, icon_y)
+
+    def _draw_pit_graphic(self, x: int, y: int, cs: int) -> None:
+        """Draw a pit using the pit image, or fallback to a dark hole."""
+        if self._pit_sprite is not None:
+            sw, sh = self._pit_sprite.get_size()
+            size = min(cs - 4, sw, sh)
+            if size > 0:
+                scale = size / max(sw, sh)
+                nw, nh = max(1, int(sw * scale)), max(1, int(sh * scale))
+                scaled = pygame.transform.smoothscale(self._pit_sprite, (nw, nh))
+                dx = x + (cs - nw) // 2
+                dy = y + (cs - nh) // 2
+                self.screen.blit(scaled, (dx, dy))
+            return
+        # Fallback: dark hole with inner shadow
+        cx, cy = x + cs // 2, y + cs // 2
+        r = min(cs // 3, 20)
+        pygame.draw.circle(self.screen, (5, 5, 25), (cx, cy), r)
+        pygame.draw.circle(self.screen, (0, 0, 0), (cx, cy), r - 2)
+        pygame.draw.ellipse(
+            self.screen, (20, 25, 50),
+            (cx - r, cy - r // 2, r * 2, r),
+            1
+        )
+
+    def _load_pit_sprite(self) -> Optional[pygame.Surface]:
+        """Load pit image from assets. Returns None on failure."""
+        try:
+            path = Path(__file__).resolve().parent / "assets" / "pit.png"
+            if not path.is_file():
+                return None
+            surf = pygame.image.load(str(path)).convert_alpha()
+            return surf if surf.get_width() and surf.get_height() else None
+        except Exception:
+            return None
+
+    def _load_arrow_sprite(self) -> Optional[pygame.Surface]:
+        """Load arrow image (weapon used to kill the Wumpus). Returns None on failure."""
+        try:
+            path = Path(__file__).resolve().parent / "assets" / "arrow.png"
+            if not path.is_file():
+                return None
+            surf = pygame.image.load(str(path)).convert_alpha()
+            return surf if surf.get_width() and surf.get_height() else None
+        except Exception:
+            return None
+
+    def _load_gold_sprite(self) -> Optional[pygame.Surface]:
+        """Load gold / treasure chest image from assets. Returns None on failure."""
+        try:
+            path = Path(__file__).resolve().parent / "assets" / "gold.png"
+            if not path.is_file():
+                return None
+            surf = pygame.image.load(str(path)).convert_alpha()
+            return surf if surf.get_width() and surf.get_height() else None
+        except Exception:
+            return None
+
+    def _load_wumpus_sprite(self) -> Optional[pygame.Surface]:
+        """Load Wumpus character image from assets. Returns None on failure."""
+        try:
+            path = Path(__file__).resolve().parent / "assets" / "wumpus.png"
+            if not path.is_file():
+                return None
+            surf = pygame.image.load(str(path)).convert_alpha()
+            return surf if surf.get_width() and surf.get_height() else None
+        except Exception:
+            return None
+
+    def _draw_wumpus_graphic(self, x: int, y: int, cs: int) -> None:
+        """Draw the Wumpus using the character image, or fallback to simple face."""
+        cx, cy = x + cs // 2, y + cs // 2
+        if self._wumpus_sprite is not None:
+            sw, sh = self._wumpus_sprite.get_size()
+            size = min(cs - 4, sw, sh)
+            if size > 0:
+                scale = size / max(sw, sh)
+                nw, nh = max(1, int(sw * scale)), max(1, int(sh * scale))
+                scaled = pygame.transform.smoothscale(self._wumpus_sprite, (nw, nh))
+                dx = x + (cs - nw) // 2
+                dy = y + (cs - nh) // 2
+                self.screen.blit(scaled, (dx, dy))
+            return
+        # Fallback: simple monster face
+        r = min(cs // 3, 18)
+        pygame.draw.circle(self.screen, DARK_RED, (cx, cy), r)
+        pygame.draw.circle(self.screen, RED, (cx, cy), r, 2)
+        eye_off = r // 2
+        pygame.draw.circle(self.screen, YELLOW, (cx - eye_off, cy - 3), 3)
+        pygame.draw.circle(self.screen, YELLOW, (cx + eye_off, cy - 3), 3)
+        pygame.draw.circle(self.screen, BLACK, (cx - eye_off, cy - 3), 1)
+        pygame.draw.circle(self.screen, BLACK, (cx + eye_off, cy - 3), 1)
+
+    def _draw_wumpus_dead_graphic(self, x: int, y: int, cs: int) -> None:
+        """Draw dead Wumpus (X eyes, gray)."""
+        cx, cy = x + cs // 2, y + cs // 2
+        r = min(cs // 3, 18)
+        pygame.draw.circle(self.screen, (50, 45, 45), (cx, cy), r)
+        pygame.draw.line(self.screen, GRAY, (cx - r, cy), (cx + r, cy), 2)
+        pygame.draw.line(self.screen, GRAY, (cx - 5, cy - 5), (cx + 5, cy + 5), 1)
+        pygame.draw.line(self.screen, GRAY, (cx + 5, cy - 5), (cx - 5, cy + 5), 1)
+
+    def _draw_gold_graphic(self, x: int, y: int, cs: int) -> None:
+        """Draw gold using the treasure chest image, or fallback to shiny coin."""
+        if self._gold_sprite is not None:
+            sw, sh = self._gold_sprite.get_size()
+            size = min(cs - 4, sw, sh)
+            if size > 0:
+                scale = size / max(sw, sh)
+                nw, nh = max(1, int(sw * scale)), max(1, int(sh * scale))
+                scaled = pygame.transform.smoothscale(self._gold_sprite, (nw, nh))
+                dx = x + (cs - nw) // 2
+                dy = y + (cs - nh) // 2
+                self.screen.blit(scaled, (dx, dy))
+            return
+        # Fallback: shiny pile/coin
+        cx, cy = x + cs // 2, y + cs // 2 - 2
+        r = min(8, cs // 4)
+        pygame.draw.circle(self.screen, (220, 180, 0), (cx, cy), r)
+        pygame.draw.circle(self.screen, YELLOW, (cx, cy), r - 1)
+        pygame.draw.circle(self.screen, (255, 235, 120), (cx - 2, cy - 2), 2)
+
+    def _draw_stench_icon(self, sx: int, sy: int) -> None:
+        """Small wavy stench lines."""
+        for i in range(3):
+            pygame.draw.arc(
+                self.screen, PURPLE,
+                (sx + i * 4, sy, 8, 8), 0, 3.14, 1
+            )
+
+    def _draw_breeze_icon(self, sx: int, sy: int) -> None:
+        """Small wind lines."""
+        for i in range(3):
+            pygame.draw.line(
+                self.screen, TEAL,
+                (sx + i * 4, sy + 6), (sx + i * 4 + 3, sy), 1
+            )
 
     # ------------------------------------------------------------------
     # Knowledge map
@@ -315,14 +489,14 @@ class WumpusRenderer:
                 else:
                     bg = KB_UNKNOWN
 
-                pygame.draw.rect(self.screen, bg, rect)
+                self._draw_cell_shading(rect, bg)
                 pygame.draw.rect(self.screen, BORDER, rect, 1)
 
                 cs = self.cell_size
                 symbols: list[tuple[str, tuple]] = []
 
                 if is_agent:
-                    self._draw_agent_arrow(x, y)
+                    self._draw_agent_sprite(x, y)
                 elif pos in kb.visited:
                     percepts = kb.visited[pos]
                     if Perception.STENCH in percepts:
@@ -334,9 +508,9 @@ class WumpusRenderer:
                     symbols.append(("✓", LIGHT_GREEN))
                 else:
                     if status == CellStatus.CONFIRMED_PIT:
-                        symbols.append(("PIT", (150, 200, 255)))
+                        self._draw_pit_graphic(x, y, cs)
                     elif status == CellStatus.CONFIRMED_WUMPUS:
-                        symbols.append(("W!", RED))
+                        self._draw_wumpus_graphic(x, y, cs)
                     elif status == CellStatus.POSSIBLY_PIT:
                         symbols.append(("?P", ORANGE))
                     elif status == CellStatus.POSSIBLY_WUMPUS:
@@ -356,21 +530,85 @@ class WumpusRenderer:
                 self.screen.blit(co, (x + self.cell_size - 22, y + self.cell_size - 13))
 
     # ------------------------------------------------------------------
-    # Agent arrow
+    # Agent sprite (sprite sheet or fallback pixel-art)
     # ------------------------------------------------------------------
 
-    def _draw_agent_arrow(self, x: int, y: int) -> None:
-        cx = x + self.cell_size // 2
-        cy = y + self.cell_size // 2
-        sz = self.cell_size // 3
+    def _load_agent_sprite_sheet(self) -> Optional[dict[Direction, pygame.Surface]]:
+        """Load 2×2 agent sprite sheet (front, back, left, right). Returns None on failure."""
+        try:
+            assets_dir = Path(__file__).resolve().parent / "assets"
+            path = assets_dir / "agent_sprite.png"
+            if not path.is_file():
+                return None
+            sheet = pygame.image.load(str(path))
+            sheet = sheet.convert_alpha()
+            w, h = sheet.get_width(), sheet.get_height()
+            if w < 2 or h < 2:
+                return None
+            self._agent_sprite_sheet = sheet
+            tw, th = w // 2, h // 2
+            # Layout: top-left=Front(SOUTH), top-right=Back(NORTH), bottom-left=Left(WEST), bottom-right=Right(EAST)
+            sprites = {
+                Direction.SOUTH: sheet.subsurface((0, 0, tw, th)),
+                Direction.NORTH: sheet.subsurface((tw, 0, tw, th)),
+                Direction.WEST: sheet.subsurface((0, th, tw, th)),
+                Direction.EAST: sheet.subsurface((tw, th, tw, th)),
+            }
+            return sprites
+        except Exception:
+            return None
 
-        tips = {
-            Direction.NORTH: [(cx, cy - sz), (cx - sz // 2, cy + sz // 2), (cx + sz // 2, cy + sz // 2)],
-            Direction.SOUTH: [(cx, cy + sz), (cx - sz // 2, cy - sz // 2), (cx + sz // 2, cy - sz // 2)],
-            Direction.EAST:  [(cx + sz, cy), (cx - sz // 2, cy - sz // 2), (cx - sz // 2, cy + sz // 2)],
-            Direction.WEST:  [(cx - sz, cy), (cx + sz // 2, cy - sz // 2), (cx + sz // 2, cy + sz // 2)],
+    # Fallback pixel-art when no sprite sheet
+    _AGENT_PIXELS = [
+        (3, 0, "H"), (4, 0, "H"),
+        (2, 1, "H"), (3, 1, "H"), (4, 1, "H"), (5, 1, "H"),
+        (3, 2, "H"), (4, 2, "H"),
+        (2, 3, "B"), (3, 3, "B"), (4, 3, "B"), (5, 3, "B"),
+        (2, 4, "B"), (3, 4, "B"), (4, 4, "B"), (5, 4, "B"),
+        (2, 5, "B"), (3, 5, "B"), (4, 5, "B"), (5, 5, "B"),
+        (3, 6, "L"), (4, 6, "L"),
+        (3, 7, "L"), (4, 7, "L"),
+    ]
+    _AGENT_COLORS = {
+        "H": (255, 220, 180),
+        "B": (28, 75, 195),
+        "L": (50, 45, 70),
+    }
+
+    def _draw_agent_sprite(self, x: int, y: int) -> None:
+        """Draw the agent using the sprite sheet (or pixel-art fallback)."""
+        cs = self.cell_size
+        direction = self.agent.direction
+
+        if self._agent_sprites is not None and direction in self._agent_sprites:
+            sprite = self._agent_sprites[direction]
+            sw, sh = sprite.get_size()
+            scale = min((cs - 4) / sw, (cs - 4) / sh, 1.0) if sw and sh else 1.0
+            nw, nh = max(1, int(sw * scale)), max(1, int(sh * scale))
+            scaled = pygame.transform.smoothscale(sprite, (nw, nh))
+            dx = x + (cs - nw) // 2
+            dy = y + (cs - nh) // 2
+            self.screen.blit(scaled, (dx, dy))
+            return
+
+        # Fallback: pixel-art person
+        pw = max(2, (cs - 8) // 8)
+        ph = max(2, (cs - 8) // 10)
+        ox = x + (cs - 8 * pw) // 2
+        oy = y + (cs - 10 * ph) // 2
+        for px, py, key in self._AGENT_PIXELS:
+            rect = pygame.Rect(ox + px * pw, oy + py * ph, pw + 1, ph + 1)
+            pygame.draw.rect(self.screen, self._AGENT_COLORS[key], rect)
+        arr = max(2, min(4, cs // 12))
+        cx, cy = x + cs // 2, y + cs // 2
+        arrows = {
+            Direction.NORTH: [(cx, oy - 1), (cx - arr, oy + arr), (cx + arr, oy + arr)],
+            Direction.SOUTH: [(cx, oy + 10 * ph + 1), (cx - arr, oy + 10 * ph - arr), (cx + arr, oy + 10 * ph - arr)],
+            Direction.EAST:  [(ox + 8 * pw + 1, cy), (ox + 8 * pw - arr, cy - arr), (ox + 8 * pw - arr, cy + arr)],
+            Direction.WEST:  [(ox - 1, cy), (ox + arr, cy - arr), (ox + arr, cy + arr)],
         }
-        pygame.draw.polygon(self.screen, YELLOW, tips[self.agent.direction])
+        pygame.draw.polygon(self.screen, YELLOW, arrows[direction])
+        pygame.draw.polygon(self.screen, (255, 255, 150), arrows[direction], 1)
 
     # ------------------------------------------------------------------
     # Sidebar (status + reasoning log)
@@ -412,6 +650,14 @@ class WumpusRenderer:
             vs = self.f_body.render(val, True, col)
             self.screen.blit(ls, (sx + self.PADDING, y))
             self.screen.blit(vs, (sx + 185, y))
+            # Arrow icon next to "Has Arrow" row (weapon to kill Wumpus)
+            if label == "Has Arrow" and self._arrow_sprite is not None:
+                aw, ah = 24, 12
+                arr = pygame.transform.smoothscale(self._arrow_sprite, (aw, ah))
+                if not kb.has_arrow:
+                    arr = arr.copy()
+                    arr.set_alpha(120)
+                self.screen.blit(arr, (sx + 185 + vs.get_width() + 6, y - 1))
             y += 18
 
         y += 4
@@ -533,7 +779,9 @@ class WumpusRenderer:
         ss = mid.render(f"Final Score: {score}", True, YELLOW)
         self.screen.blit(ss, (cx - ss.get_width() // 2, cy + 10))
 
-        hs = small.render("Press any key to exit", True, GRAY)
-        self.screen.blit(hs, (cx - hs.get_width() // 2, cy + 55))
+        play_again = small.render("ENTER or R = Play again", True, LIGHT_GREEN)
+        quit_hint = small.render("Q = Quit", True, GRAY)
+        self.screen.blit(play_again, (cx - play_again.get_width() // 2, cy + 48))
+        self.screen.blit(quit_hint, (cx - quit_hint.get_width() // 2, cy + 66))
 
         pygame.display.flip()

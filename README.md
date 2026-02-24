@@ -42,6 +42,31 @@ uv run wumpus-world
 
 A difficulty-selection menu appears. Use **↑ / ↓** or **1 / 2 / 3** to choose, then **Enter**.
 
+### Running with 2D graphics
+
+The simulation uses **Pygame** for a 2D graphical window. To run with the full 2D display:
+
+1. **Use a machine with a display** (local desktop or a session with `DISPLAY` / `WAYLAND_DISPLAY` set). On headless servers or CI, the app will fall back to terminal-only mode unless you force graphics (see below).
+
+2. **Install and run** (no extra flags needed for graphics):
+   ```bash
+   uv sync
+   uv run wumpus-world
+   ```
+
+3. **What you get:** A Pygame window with:
+   - **Actual World** (left): fog-of-war grid; pits, Wumpus, and gold drawn as 2D graphics; agent sprite with direction arrow.
+   - **Agent Knowledge Base** (centre): same 2D art for confirmed pits/Wumpus; colour-coded beliefs.
+   - **Sidebar** (right): KB stats, legend, and live AI reasoning log.
+
+4. **Force graphical mode:** To insist on the Pygame window (e.g. if auto-detect is wrong), use:
+   ```bash
+   uv run wumpus-world --graphical
+   # or
+   uv run wumpus-world -g
+   ```
+   If no window appears, ensure `DISPLAY` (X11) or `WAYLAND_DISPLAY` (Wayland) is set and that `WUMPUS_HEADLESS` is not set.
+
 ### Headless / terminal mode
 
 ```bash
@@ -79,6 +104,8 @@ All dangerous elements (pits and Wumpus) are placed **outside** the cells adjace
 ---
 
 ## Display Layout
+
+The 2D graphics window shows two grids plus a sidebar. Cells use drawn graphics for the agent (explorer + direction arrow), pits (holes), Wumpus (monster face), and gold (coin); stench and breeze are shown as small icons.
 
 ```
 ┌─────────────────────┬──────────────────────┬───────────────────────────┐
